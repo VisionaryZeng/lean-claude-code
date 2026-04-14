@@ -143,6 +143,22 @@ def execute_tool_calls(response_content) -> list[dict]:
 
 def run_one_turn(state: LoopState) -> bool:
     # 获取 LLM 返回结果
+
+    """
+    Response 对象（Message）中的核心元素: 最常接触到的主要有以下几个
+
+    元素,               类型,       说明
+    id,                str,        该条消息的唯一标识符（以 msg_ 开头）。
+    type,              str,        "永远是 ""message""。"
+    role,              str,        "永远是 ""assistant""。"
+    content,           list,       最重要的部分。包含一个或多个内容块（Text 或 Tool Use）。
+    model,             str,        实际使用的模型名称（如 claude-3-5-sonnet-20240620）。
+    stop_reason,       str,        关键指标。模型停止生成的原因。
+    stop_sequence,     str,        如果是因为触发了自定义停止符而停止，这里会记录该字符。
+    usage,             dict,       包含 input_tokens 和 output_tokens，用于计算费用。
+
+    """
+
     response = client.messages.create(
         model=MODEL,
         system=SYSTEM,
@@ -152,6 +168,26 @@ def run_one_turn(state: LoopState) -> bool:
     )
 
     # 记录 assistant 响应消息
+    """
+    
+    response.content  的结构是一个列表，主要包含① 文本块 (TextBlock) 和 ② 工具调用块 (ToolUseBlock)，伪代码如下，
+    
+    [
+        # 第一个块：说话
+        {"text": "LLM 说的话 "},
+        
+        # 第二个块：下达指令
+        {
+            "type": "tool_use",
+            "id": "toolu_01A2B3C4",
+            "name": "bash",
+            "input": {
+                "command": "ls -la"
+            }
+        }
+    ]
+    
+    """
     state.messages.append({'role': 'assistant', 'content': response.content})
 
     # 没有工具调用时应结束循环
