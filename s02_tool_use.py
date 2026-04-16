@@ -27,11 +27,14 @@
 
 import os
 import subprocess
-from dataclasses import dataclass
+from pathlib import Path
+
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+WORKDIR = Path.cwd()
 
 MODEL = os.getenv('MODEL_ID')
 
@@ -66,22 +69,55 @@ TOOLS = [
             # 必填的参数
             "required": ["command"],
         }
-    }
+    },
+    {
+        "name": "read_file",
+        "description": "Read file content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description" : "Path from current workdir"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["path"],
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write file content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description" : "Path from current workdir"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        }
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text in file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description" : "Path from current workdir"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        }
+    },
 ]
 
 client = Anthropic(base_url=os.getenv('ANTHROPIC_BASE_URL'))
 
 
-@dataclass
-class LoopState:
-    # 定义消息列表，思考循环次数，继续思考循环的理由
-
-    messages: list
-    turn_count: int = 0
-    transition_reason: str | None = None
-
-
 def run_bash(command: str) -> str:
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+
+    if any(d in command for d in dangerous):
+        return f"Error: Dangerous command blocked"
+
     try:
         result = subprocess.run(
             # 运行的具体命令字符串（如 ls -la 或 python3 script.py）
@@ -106,90 +142,140 @@ def run_bash(command: str) -> str:
     return output[:5000] if output else "(no output)"
 
 
-def execute_tool_calls(response_content) -> list[dict]:
-    results = []
+def safe_path(path: str) -> Path:
+    # 获取完整的绝对路径
+    absolute_path = (WORKDIR / path).resolve()
+    # 确保路径在工作路径下
+    if not absolute_path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {path}")
+    return absolute_path
 
-    '''
-    block 格式类似下面这样
 
-    {
-        "type": "tool_use",
-        "id": "toolu_01A2B3C4",
-        "name": "bash",
-        "input": {
-            "command": "ls -la"
-        }
-    }
-    '''
+def run_read(path: str, limit: int = None) -> str:
+    text = safe_path(path).read_text()
+    lines = text.splitlines()
+    #  如果有限制就按限制行数读取
+    if limit and limit < len(lines):
+        lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+    # 没有限制就默认读取前 5w 个字符[:50000]
+    return "\n".join(lines)[:50000]
 
-    for block in response_content:
-        if block.type != "tool_use":
+
+def run_write(path: str, content: str) -> str:
+    file_path = safe_path(path)
+    # 确保目标文件所在的父目录一定存在，如果不存在就自动创建，如果已经存在也不报错。
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content)
+    return f"Wrote {len(content)} bytes to {path}"
+
+
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    file_path = safe_path(path)
+    # 先读取所有的文本
+    content = file_path.read_text()
+    # 如果 要替换的文本 在 原文本中,直接替换
+    if old_text in content:
+        # 替换之后再写入
+        content = content.replace(old_text, new_text, 1)
+        file_path.write_text(content)
+        return f"Edited {path}"
+    # 没有找到要替换的文本，直接返回
+    return f"Error: Text not found in {path}"
+
+
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw['command']),
+    "read_file": lambda **kw: run_read(kw['path'], kw.get('limit')),
+    "write_file": lambda **kw: run_write(kw['path'], kw['content']),
+    "edit_file": lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
+}
+
+
+def normalize_messages(messages: list) -> list:
+    # 剥离 LLM 不认识的内部元数据
+    cleand = []
+    for msg in messages:
+        clean = {"role": msg['role']}
+        if isinstance(msg["content"], str):
+            clean["content"] = msg["content"]
+        elif isinstance(msg["content"], list):
+            # 类似于 Java 中的lambda 表达式，先获取msg["content"]的字典，然后再过滤掉字典中私有变量
+            # 现在 装入 clean["content"] 的是一个列表，列表的每个元素都是一个字典
+            clean["content"] = [{k: v for k, v in block.items() if not k.startswith('_')} for block in msg["content"] if isinstance(block, dict)]
+        else:
+            clean["content"] = msg.get("content", "")
+        cleand.append(clean)
+    # 确保每个工具使用都有一个执行结果返回
+    # 收集 有 tool_result 的 tool_use ID
+    existing_results = set()
+
+    for msg in cleand:
+        if isinstance(msg["content"], list):
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    existing_results.add(block.get("tool_use_id"))
+    # 将没有 tool_result 的 tool_use 补齐取消
+    for msg in cleand:
+        if msg["role"] != "assistant" and not isinstance(msg["content"], list):
             continue
+        for block in msg["content"]:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") not in existing_results:
+                cleand.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block["id"],
+                            "content": "(cancelled)"
+                        }
+                    ]
+                })
 
-        command = block.input['command']
-        # 打印 要执行的命令
-        print(f"\033[33m$ {command}\033[0m")
-        # 执行命令
-        output = run_bash(command)
-        # 打印 要执行的结果
-        print(output[:200])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output
-        })
-    return results
+    if len(cleand) == 0:
+        return cleand
 
+    # 合并相同角色的消息
+    merged = [cleand[0]]
+    for msg in cleand[1:]:
+        pre_msg = merged[-1]
+        if pre_msg["role"] == msg["role"]:
+            pre_content = pre_msg["content"] if isinstance(pre_msg["content"], list) else [{"type": "text", "content": str(pre_msg["content"])}]
+            cur_content = msg["content"] if isinstance(msg["content"], list) else [{"type": "text", "content": str(msg["content"])}]
+            # 列表支持 用 + 直接合并
+            pre_msg["content"] = pre_content + cur_content
+        else:
+            merged.append(msg)
+    return merged
 
-def run_one_turn(state: LoopState) -> bool:
-    # 获取 LLM 返回结果
-    response = client.messages.create(
-        model=MODEL,
-        system=SYSTEM,
-        tools=TOOLS,
-        messages=state.messages,
-        max_tokens=8000
-    )
-
-    # 记录 assistant 响应消息
-    state.messages.append({'role': 'assistant', 'content': response.content})
-
-    # 没有工具调用时应结束循环
-    if response.stop_reason != 'tool_use':
-        state.transition_reason = None
-        return False
-
-    # 执行工具调用
-    result = execute_tool_calls(response.content)
-
-    # 工具调用时没有结果应结束循环
-    if not result:
-        state.transition_reason = None
-        return False
-
-    # 准备进入下一轮思考循环
-    state.messages.append({'role': 'user', 'content': result})
-    state.transition_reason = 'tool_result'
-    state.turn_count += 1
-    return True
-
-
-def agent_loop(state: LoopState) -> None:
+def agent_loop(messages: list) -> None:
     # 类似 do while
-    while run_one_turn(state):
-        pass
+    while True:
+        # 获取 LLM 返回结果
+        response = client.messages.create(
+            model=MODEL,
+            system=SYSTEM,
+            tools=TOOLS,
+            messages=normalize_messages(messages),
+            max_tokens=8000
+        )
 
+        # 规范化消息，记录 assistant 响应消息
+        messages.append({'role': 'assistant', 'content': response.content})
 
-def extract_text(content) -> str:
-    if not isinstance(content, list):
-        return ''
-    texts = ['========== ========== 执行结果 ========== ==========']
-    for block in content:
-        text = getattr(block, 'text', None)
-        if text:
-            texts.append(text)
+        # 停止运行时没有要求调用工具，直接结束
+        if response.stop_reason != 'tool_use':
+            return
 
-    return '\n'.join(texts).strip()
+        # 需要调用工具时，支持执行多条命令
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                print(f"> {block.name}: {block.input}")
+                tool_handler = TOOL_HANDLERS.get(block.name)
+                output = tool_handler(**block.input) if tool_handler else f"Unknown tool: {block.name}"
+                print(f" output: {output[:200]}")
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        messages.append({"role": "user", "content": results})
 
 
 if __name__ == '__main__':
@@ -206,14 +292,15 @@ if __name__ == '__main__':
             break
 
         history.append({'role': 'user', 'content': query})
-        # 初始化状态
-        state = LoopState(messages=history)
-
         # 开启思考循环
-        agent_loop(state)
+        agent_loop(history)
 
         # 获取最后一条消息
-        finalMessage =extract_text(history[-1]['content'])
-        if finalMessage:
-            print(finalMessage)
+        response_content = history[-1]['content']
+        if isinstance(response_content, list):
+            texts = ['========== ========== 执行结果 ========== ==========']
+            for block in response_content:
+                if getattr(block, 'text', None):
+                    texts.append(block.text)
+            print('\n'.join(texts).strip())
         print()
