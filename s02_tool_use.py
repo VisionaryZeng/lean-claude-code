@@ -115,6 +115,10 @@ client = Anthropic(base_url=os.getenv('ANTHROPIC_BASE_URL'))
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
 
+    # for d in dangerous: 它会遍历 dangerous 列表中的每一个元素，并将其临时赋值给变量 d
+    # d in command：这是一个子字符串匹配操作。它在检查当前的危险词 d 是否出现在 AI 生成的字符串 command 之中
+    # (d in command for d in dangerous)：这是一个生成器表达式,它不会立刻生成一个完整的列表，而是产生一个序列，里面包含了一连串的 True 或 False
+    # any(...)：这是 Python 的内置函数。它的规则是：只要序列中有一个元素是 True，结果就是 True；只有全部都是 False 时，结果才是 False
     if any(d in command for d in dangerous):
         return f"Error: Dangerous command blocked"
 
@@ -176,6 +180,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     # 如果 要替换的文本 在 原文本中,直接替换
     if old_text in content:
         # 替换之后再写入
+        # 1 的意思只替换第一次遇到的匹配项，剩下的哪怕一模一样也不动
         content = content.replace(old_text, new_text, 1)
         file_path.write_text(content)
         return f"Edited {path}"
@@ -184,7 +189,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
+    # lambda (匿名函数) 是 Python 定义单行简易函数的关键字，充当了适配器
+    # **kw (关键字参数收集) **（双星号）在 Python 参数列表中代表 “收集所有多余的关键字参数到一个字典中”
+    # run_bash(kw["command"]) (函数体)  从刚才收集到的 kw 字典中，取出键名为 "command" 的值
     "bash": lambda **kw: run_bash(kw['command']),
+    # 可选参数limit：kw.get('limit') 用 get 防止报错
     "read_file": lambda **kw: run_read(kw['path'], kw.get('limit')),
     "write_file": lambda **kw: run_write(kw['path'], kw['content']),
     "edit_file": lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
@@ -210,11 +219,13 @@ def normalize_messages(messages: list) -> list:
     existing_results = set()
 
     for msg in cleand:
+        # msg.get("content") 如果取不到值，返回 None，不会报错
         if isinstance(msg["content"], list):
+            # msg["content"] 如果取不到值，直接会报错
             for block in msg["content"]:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     existing_results.add(block.get("tool_use_id"))
-    # 将没有 tool_result 的 tool_use 补齐取消
+    # # 将 LLM 执行后但没有结果的 工具，设置为取消，将没有 tool_result 的 tool_use 补齐取消
     for msg in cleand:
         if msg["role"] != "assistant" and not isinstance(msg["content"], list):
             continue
