@@ -233,7 +233,8 @@ TOOLS = [
                             },
                             "status": {
                                 "type": "string",
-                                "enum": {"pending", "in_process", "completed"}
+                                # 只能用 元组才能序列化成 JSON，不能用集合，否则： Object of type set is not JSON serializable
+                                "enum": ["pending", "in_progress", "completed"]
                             },
                             "active_form": {
                                 "type": "string",
@@ -321,12 +322,14 @@ def normalize_messages(messages: list) -> list:
     return merged
 
 
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> None:
     while True:
         response = client.messages.create(
-            model=MODEL, system=SYSTEM,
+            model=MODEL,
+            system=SYSTEM,
             messages=normalize_messages(messages),
-            tools=TOOLS, max_tokens=8000,
+            tools=TOOLS,
+            max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
@@ -372,7 +375,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
