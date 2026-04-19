@@ -27,7 +27,6 @@
 import os
 import subprocess
 from dataclasses import dataclass, field
-from email.policy import default
 from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -64,6 +63,10 @@ class PlanState:
     # 距离上一次更新 TODO 后多少轮思考循环没更新了
     round_since_update: int = 0
 
+"""
+只暴露给 LLM 更新接口，并返回 任务进度 和 各任务状态，让 LLM 像调用工具那样更新计划
+在 LLM 没有更新 计划时，创建计数器，提醒 LLM 及时更新 计划
+"""
 
 @dataclass
 class TodoManager:
@@ -363,6 +366,7 @@ def agent_loop(messages: list) -> None:
             if reminder:
                 results.insert(0, {"type": "text", "text": reminder})
         else:
+            # 有更新时，将计数器 重置为 0
             TODO.state.round_since_update = 0
 
         messages.append({

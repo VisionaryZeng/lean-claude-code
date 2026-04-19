@@ -197,7 +197,10 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
+"""
+子代理也是一个函数，只是调用了 LLM 的函数
+把子代理注册到 TOOL 中，LLM 便可以像使用工具一样使用子代理
+"""
 def run_subagent(prompt: str) -> str:
     subagent_messages = []
     subagent_messages.append({"role": "user", "content": prompt})
