@@ -217,12 +217,12 @@ def run_subagent(prompt: str) -> str:
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                print(f"subagent > {block.name}: {block.input}")
+                print(f"[subagent] parameter> {block.name}: {block.input}")
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
-                print(f"subagent > {block.name}: {str(output)[:200]}")
+                print(f"[subagent] result> {block.name}: {str(output)[:200]}")
                 subagent_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -233,7 +233,8 @@ def run_subagent(prompt: str) -> str:
     # 只取最后的结果信息
     # 在 Python 中，for 循环和 if 语句不会开启新的作用域。
     # Python 里，变量的作用域通常只有两种：全局（Global）和函数级（Function）。
-    return "".join( block.text for block in response.content if hasattr(block, "text") or "(no summary)")
+    # or 是最后兜底的作用，解决 > task: Error: 'ThinkingBlock' object has no attribute 'text'
+    return "".join( block.text for block in response.content if hasattr(block, "text")) or "(subagent completed but no summary)"
 
 # -- Concurrency safety classification --
 # Read-only tools can safely run in parallel; mutating tools must be serialized.
@@ -377,18 +378,20 @@ def agent_loop(messages: list) -> None:
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                print(f"> {block.name}: {block.input}")
+                print(f"> {block.name} parameter: {block.input}")
                 try:
                     if block.name == "task":
                         desc = str(block.input.get("description", "subtask"))
                         prompt = str(block.input.get("prompt", ""))
+                        print("========== ========== subagent 开始 ========== ==========")
                         print(f"> task ({desc}): {prompt[:80]}")
                         output = run_subagent(prompt)
+                        print("========== ========== subagent 结束 ========== ==========")
                     else:
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> {block.name} result: {str(output)[:200]}")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -415,7 +418,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -426,5 +429,7 @@ if __name__ == "__main__":
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
+                    print()
+                    print('========== ========== 执行结果 ========== ==========')
                     print(block.text)
         print()
