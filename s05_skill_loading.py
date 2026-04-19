@@ -40,6 +40,60 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
+@dataclass
+class SkillManifest:
+    name: str
+    description: str
+    path: Path
+
+
+@dataclass
+class SkillDocument:
+    # 技能元数据
+    manifest: SkillManifest
+    # 技能正文
+    body: str
+
+
+"""
+实现了下面3个步骤，保证 LLM 可以像调用工具一样加载 skill
+
+1. 技能注册(_load_all_skill)：建立“图书馆”索引
+    程序启动时，SkillRegistry 会执行一次“全城搜索”。
+    代码动作：_load_all() 扫描目录，_parse_frontmatter() 拆分元数据和正文。
+    最终结果：在内存中形成一个 self.documents 字典。
+    深度理解：这一步是离线完成的。它保证了当 AI 询问时，系统能立即知道“有没有这个技能”以及“它在哪里”。
+
+2. 元数据描述(descript_variable)：给 LLM 看“书目清单”
+    你不需要把书的内容全念给 AI 听，只需要给它一张导览表。
+    代码动作：在 SYSTEM 提示词中插入了 {SKILL_REGISTRY.describe_available()}。
+    最终结果：AI 的初始记忆里只有类似 - ffmpeg: 视频处理专家 这样的短句。
+    深度理解：这是为了节省 Token 并减少干扰。如果 AI 只是在写一个简单的 Python 脚本，它不需要知道 FFmpeg 的 50 个复杂命令参数。
+
+3. 按需加载(load_full_text)：实现“查阅手册”的动作
+    这是最关键的闭环。
+    代码动作：定义了 load_skill 工具，并在 TOOL_HANDLERS 中关联了 load_full_text 函数。
+    最终结果：当 AI 发现自己“知识不足”时，它会主动说：{"name": "load_skill", "arguments": {"name": "ffmpeg"}}。
+    深度理解：加载后的正文被包裹在 <skill> 标签中回传。这在对话历史中产生了一个强烈的上下文信号，告诉 AI：“现在你已经学会了这个专业技能，请开始表演。”
+"""
+
+class SkillRegistry:
+    def __init__(self, skill_dir: Path):
+        self.skills_dir = skill_dir
+        self.documents : dict[str, SkillDocument] = {}
+        self._load_all_skill()
+
+    # 加载 skills 文件夹下 所有技能
+    def _load_all_skill(self) -> None:
+        pass
+
+    # 给 system prompt 描述技能
+    def descript_variable(self) -> str:
+        pass
+
+    # 按需加载技能
+    def load_full_text(self, skill_name: str) -> str:
+        pass
 
 @dataclass
 class PlanItem:
