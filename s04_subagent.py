@@ -37,12 +37,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-SYSTEM = f"""
-You are a coding agent at {WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose.
-"""
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
 @dataclass
@@ -202,19 +198,75 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def run_subagent(prompt: str) -> str:
+    subagent_messages = []
+    subagent_messages.append({"role": "user", "content": prompt})
+    # 只允许执行 30 轮
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=normalize_messages(subagent_messages),
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        subagent_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        subagent_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                print(f"subagent > {block.name}: {block.input}")
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as exc:
+                    output = f"Error: {exc}"
+                print(f"subagent > {block.name}: {str(output)[:200]}")
+                subagent_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    # anthropic 规定 content 必须是 字符串
+                    "content": str(output)
+                })
+        subagent_messages.append({"role": "user", "content": subagent_results})
+    # 只取最后的结果信息
+    # 在 Python 中，for 循环和 if 语句不会开启新的作用域。
+    # Python 里，变量的作用域通常只有两种：全局（Global）和函数级（Function）。
+    return "".join( block.text for block in response.content if hasattr(block, "text") or "(no summary)")
+
 # -- Concurrency safety classification --
 # Read-only tools can safely run in parallel; mutating tools must be serialized.
 CONCURRENCY_SAFE = {"read_file"}
 CONCURRENCY_UNSAFE = {"write_file", "edit_file"}
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
-    "todo": lambda **kw: TODO.update(kw["plan_items"]),
+    # "todo": lambda **kw: TODO.update(kw["plan_items"]),
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
-TOOLS = [
+CHILD_TOOLS = [
+    {"name": "bash", "description": "Run a shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+]
+
+PARENT_TOOLS = CHILD_TOOLS + [
+    {
+        "name": "task",
+        "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "description": {"type": "string", "description": "Short description of the task"},
+            }
+        },
+        "required": ["prompt"],
+    },
     {
         "name": "todo",
         "description": "write the current session plan for multi-step work. ",
@@ -247,21 +299,7 @@ TOOLS = [
             "required": ["plan_items"]
         }
     },
-
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
-                                                       "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
 ]
-
 
 def normalize_messages(messages: list) -> list:
     """Clean up messages before sending to the API.
@@ -327,7 +365,7 @@ def agent_loop(messages: list) -> None:
             model=MODEL,
             system=SYSTEM,
             messages=normalize_messages(messages),
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
@@ -341,7 +379,13 @@ def agent_loop(messages: list) -> None:
                 handler = TOOL_HANDLERS.get(block.name)
                 print(f"> {block.name}: {block.input}")
                 try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    if block.name == "task":
+                        desc = str(block.input.get("description", "subtask"))
+                        prompt = str(block.input.get("prompt", ""))
+                        print(f"> task ({desc}): {prompt[:80]}")
+                        output = run_subagent(prompt)
+                    else:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
                 print(f"> {block.name}: {str(output)[:200]}")
@@ -364,10 +408,7 @@ def agent_loop(messages: list) -> None:
         else:
             TODO.state.round_since_update = 0
 
-        messages.append({
-            "role": "user",
-            "content": results
-        })
+        messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
