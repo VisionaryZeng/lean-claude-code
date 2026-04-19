@@ -46,7 +46,7 @@ Refresh the plan as work advances. Prefer tools over prose.
 
 
 @dataclass
-class Task:
+class PlanItem:
     # 当前任务
     content: str
     # 当前任务状态
@@ -59,7 +59,7 @@ class Task:
 class PlanState:
     # 计划中的所有任务
     # field(default_factory=list) python 专用创建列表或字典的方法，直接用[] 会导致不同实例共享同一个列表
-    tasks: list[Task] = field(default_factory=list)
+    plan_items: list[PlanItem] = field(default_factory=list)
     # 距离上一次更新 TODO 后多少轮思考循环没更新了
     round_since_update: int = 0
 
@@ -72,66 +72,66 @@ class TodoManager:
 
     # 全量更新 TODO 列表
     # 先做校验，然后规范化之后再装入
-    # LLM 传过来的是一个 dict, 而不是 Task，为了让 LLM 知道自己传的参数，先使用 dict ,
-    # 未来可以使用 Dacite 或 Pydantic 等工具直接将dict 转换为 Task， 类似与 Java 中的 Jackson
+    # LLM 传过来的是一个 dict, 而不是 PlanItem，为了让 LLM 知道自己传的参数，先使用 dict ,
+    # 未来可以使用 Dacite 或 Pydantic 等工具直接将dict 转换为 PlanItem， 类似与 Java 中的 Jackson
 
-    def update(self, tasks: list[dict]) -> str:
+    def update(self, plan_items: list[dict]) -> str:
         # 任务不能超过 12 个
-        if len(tasks) > 12:
+        if len(plan_items) > 12:
             raise ValueError("Keep the session plan short (max 12 items)")
 
         process_count = 0
         normalized = []
         # 校验每个任务中的元素
         # enumerate(items)：它像是一个工厂，把列表里的每个元素包装成一个元组（Tuple），长这样：(0, {"content": "A"}), (1, {"content": "B"})
-        for index, raw_task in enumerate(tasks):
-            content = str(raw_task.get("content", "")).strip()
-            status = str(raw_task.get("status", "")).lower()
-            active_form = str(raw_task.get("active_form", "")).strip()
+        for index, raw_item in enumerate(plan_items):
+            content = str(raw_item.get("content", "")).strip()
+            status = str(raw_item.get("status", "")).lower()
+            active_form = str(raw_item.get("active_form", "")).strip()
             # 校验任务目标是否存在
             if not content:
-                raise ValueError(f"task {index}: content required")
+                raise ValueError(f"Plan item {index}: content required")
 
             # 校验 任务状态 是否是枚举值
             # ｛｝ 表示集合，() 表示元组，集合的查找算法复杂度是 O(1)，元组的算法复杂度是O(N)
             if status not in {"pending", "in_progress", "completed"}:
-                raise ValueError(f"task {index}: invalid status '{status}'")
+                raise ValueError(f"Plan item {index}: invalid status '{status}'")
 
             if status == "in_progress":
                 process_count += 1
 
             # 正在进行中 的任务只能是一个
             if process_count > 1:
-                raise ValueError("Only one plan task can be in_progress")
+                raise ValueError("Only one plan item can be in_progress")
 
             # 通过校验就添加
-            task = Task(content=content, status=status, active_form=active_form)
-            normalized.append(task)
+            item = PlanItem(content=content, status=status, active_form=active_form)
+            normalized.append(item)
 
-        self.state.tasks = normalized
+        self.state.plan_items = normalized
         self.state.round_since_update = 0
         return self.render()
 
     # 更新之后 返回 更新的 TODO 列表状态字符串
     def render(self) -> str:
-        if not self.state.tasks:
+        if not self.state.plan_items:
             return "No session plan yet."
 
         lines = []
         # 统计 所有已完成的 任务
-        completed = sum(1 for task in self.state.tasks if task.status == "completed")
-        lines.append(f"({completed} / {len(self.state.tasks)} completed)")
+        completed = sum(1 for item in self.state.plan_items if item.status == "completed")
+        lines.append(f"({completed} / {len(self.state.plan_items)} completed)")
         # 渲染每个任务的细节
-        for task in self.state.tasks:
+        for item in self.state.plan_items:
             marker = {
                 "pending": "[ ]",
                 "in_progress": "[>]",
                 "completed": "[√]",
-            }[task.status]
-            line = f"{marker} {task.content}"
+            }[item.status]
+            line = f"{marker} {item.content}"
             # 正在处理的任务需要展示正在执行的内容
-            if task.status == "in_progress" and task.active_form:
-                line += f": {task.active_form}"
+            if item.status == "in_progress" and item.active_form:
+                line += f": {item.active_form}"
             lines.append(line)
 
         return '\n'.join(lines)
@@ -140,7 +140,7 @@ class TodoManager:
         self.state.round_since_update += 1
 
     def reminder(self) -> str | None:
-        if len(self.state.tasks) == 0 or self.state.round_since_update < 3:
+        if len(self.state.plan_items) == 0 or self.state.round_since_update < 3:
             return None
         else:
             return '<reminder>Refresh your current plan before continuing.</reminder>'
@@ -208,7 +208,7 @@ CONCURRENCY_SAFE = {"read_file"}
 CONCURRENCY_UNSAFE = {"write_file", "edit_file"}
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
-    "todo": lambda **kw: TODO.update(kw["tasks"]),
+    "todo": lambda **kw: TODO.update(kw["plan_items"]),
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
@@ -221,7 +221,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "tasks": {
+                "plan_items": {
                     "type": "array",
                     "items": {
                         "type": "object",
@@ -244,7 +244,7 @@ TOOLS = [
                     }
                 }
             },
-            "required": ["tasks"]
+            "required": ["plan_items"]
         }
     },
 
