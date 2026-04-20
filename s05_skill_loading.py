@@ -57,6 +57,9 @@ class SkillDocument:
 
 
 """
+
+这个版本的 skill 比较松散，LLM 容易走神。工程优化方向： 只要加载 Skill 就必须强制生成 Todo
+
 实现了下面3个步骤，保证 LLM 可以像调用工具一样加载 skill
 
 1. 技能注册(_registry_skill)：建立“图书馆”索引
