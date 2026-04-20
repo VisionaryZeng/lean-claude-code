@@ -140,14 +140,12 @@ class SkillRegistry:
             know = "".join(sorted(self.documents)) or "(none)"
             return f"Unknow skill '{skill_name}'. Available skills: {know}"
 
-
 SKILL_REGISTRY = SkillRegistry(WORKDIR / "skills")
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill when a task needs specialized instructions before you act.
 Skills available:
 {SKILL_REGISTRY.descript_skill()}
 """
-
 
 @dataclass
 class PlanItem:
@@ -247,9 +245,7 @@ class TodoManager:
         else:
             return '<reminder>Refresh your current plan before continuing.</reminder>'
 
-
 TODO = TodoManager()
-
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
