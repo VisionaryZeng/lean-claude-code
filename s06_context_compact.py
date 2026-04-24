@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from anthropic import Anthropic
+from anthropic.types import TextBlock
 from dotenv import load_dotenv
 
 
@@ -41,6 +42,7 @@ CONTEXT_LIMIT = 50000
 PREVIEW_CHARS = 2000
 PERSIST_THRESHOLD = 30000
 WORKDIR = Path.cwd()
+print(f"WORKDIR: {WORKDIR}")
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
@@ -59,7 +61,7 @@ class CompactState:
     # 当前总结的摘要
     last_summary: str = ""
     # 最近操作的文件
-    recent_files: list[str] = field(default=list)
+    recent_files: list[str] = field(default_factory=list)
 
 @dataclass
 class SkillManifest:
@@ -278,6 +280,7 @@ TODO = TodoManager()
 
 
 def safe_path(p: str) -> Path:
+    # pathlib 的 / 操作符对绝对路径有特殊处理：如果右边p是绝对路径，会忽略左边WORKDIR的路径。
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -297,7 +300,7 @@ def run_bash(command: str, tool_use_id: str) -> str:
         return "Error: Timeout (120s)"
 
 # 维护一个始终包含最新、且不重复的 5 个文件的“快捷清单”
-def record_recent_file(path, state):
+def record_recent_file(path, state: CompactState):
     # python 中 remove(path) 方法必须确保 path 在 state.recent_files 里面
     if path in state.recent_files:
         state.recent_files.remove(path)
@@ -640,7 +643,9 @@ def summarize_history(messages: list) -> str:
         max_tokens=2000,
     )
 
-    return response.content[0].text.strip()
+    # 获取所有的 文本，避免使用ThinkingBlock时，缺少 text 属性
+    summary = [block.text.strip() for block in response.content if isinstance(block, TextBlock)]
+    return "\n".join(summary)
 
 
 def compact_history(messages: list, state: CompactState, focus: str | None = None) -> list:
@@ -665,6 +670,37 @@ def compact_history(messages: list, state: CompactState, focus: str | None = Non
             f"{state.last_summary}"
         )
     }]
+
+
+# 由于增加了 block.id 和 state，需要用适配器连接
+def execute_tool(block, state: CompactState) -> str:
+    print(f"> {block.name} parameter: {block.input}")
+    fn = block.name
+
+    if fn == "bash":
+        output = run_bash(block.input["command"], block.id)
+    elif fn == "read_file":
+        output = run_read(block.input["path"], block.id, state, block.input.get("limit"))
+    elif fn == "write_file":
+        output = run_write(block.input["path"], block.input["content"])
+    elif fn == "edit_file":
+        output = run_edit(block.input["path"], block.input["old_text"], block.input["new_text"])
+    elif fn == "load_skill":
+        output = SKILL_REGISTRY.load_skill(block.input["skill_name"])
+    elif fn == "todo":
+        output = TODO.update(block.input["plan_items"])
+    elif fn == "task":
+        desc = str(block.input.get("description", "subtask"))
+        prompt = str(block.input.get("prompt", ""))
+        print("========== ========== subagent 开始 ========== ==========")
+        print(f"> task ({desc}): {prompt[:80]}")
+        output = run_subagent(block.input["prompt"])
+        print("========== ========== subagent 结束 ========== ==========")
+    else:
+        output = f"Unknown tool: {fn}"
+
+    return output
+
 
 def agent_loop(messages: list, state: CompactState) -> None:
     while True:
@@ -694,18 +730,8 @@ def agent_loop(messages: list, state: CompactState) -> None:
         compact_goal = None
         for block in response.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                print(f"> {block.name} parameter: {block.input}")
                 try:
-                    if block.name == "task":
-                        desc = str(block.input.get("description", "subtask"))
-                        prompt = str(block.input.get("prompt", ""))
-                        print("========== ========== subagent 开始 ========== ==========")
-                        print(f"> task ({desc}): {prompt[:80]}")
-                        output = run_subagent(prompt)
-                        print("========== ========== subagent 结束 ========== ==========")
-                    else:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    output = execute_tool(block, state)
                 except Exception as exc:
                     output = f"Error: {exc}"
                 print(f"> {block.name} result: {str(output)[:200]}")
@@ -742,15 +768,16 @@ def agent_loop(messages: list, state: CompactState) -> None:
 
 if __name__ == "__main__":
     history = []
+    state = CompactState()
     while True:
         try:
-            query = input("\033[36ms05 >> \033[0m")
+            query = input("\033[36ms06 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history, state)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:

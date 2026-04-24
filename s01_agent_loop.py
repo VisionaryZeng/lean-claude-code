@@ -151,7 +151,7 @@ def run_one_turn(state: LoopState) -> bool:
     id,                str,        该条消息的唯一标识符（以 msg_ 开头）。
     type,              str,        "永远是 ""message""。"
     role,              str,        "永远是 ""assistant""。"
-    content,           list,       最重要的部分。包含一个或多个内容块（Text 或 Tool Use）。
+    content,           list,       最重要的部分。包含一个或多个内容块（Text, ThinkingBlock 或 Tool Use）。
     model,             str,        实际使用的模型名称（如 claude-3-5-sonnet-20240620）。
     stop_reason,       str,        关键指标。模型停止生成的原因。
     stop_sequence,     str,        如果是因为触发了自定义停止符而停止，这里会记录该字符。
