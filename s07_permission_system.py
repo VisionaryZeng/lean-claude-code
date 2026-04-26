@@ -30,7 +30,10 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
+from enum import Enum
+from fnmatch import fnmatch
 from pathlib import Path
+
 from anthropic import Anthropic
 from anthropic.types import TextBlock
 from dotenv import load_dotenv
@@ -277,6 +280,149 @@ class TodoManager:
 
 
 TODO = TodoManager()
+
+class MODE(Enum):
+    DEFAULT = "default"
+    PLAN = "plan"
+    AUTO = "auto"
+
+MODES = (MODE.DEFAULT, MODE.PLAN, MODE.AUTO)
+
+class Behavior(Enum):
+    ASK = "ask"
+    ALLOW = "allow"
+    DENY = "deny"
+
+DEFAULT_RULES = [
+    {"tool": "bash", "content": "rm -rf /", "behavior": Behavior.DENY},
+    {"tool": "bash", "content": "sudo *", "behavior": Behavior.DENY},
+    {"tool": "read_file", "path": "*", "behavior": Behavior.ALLOW},
+]
+
+@dataclass
+class Decision:
+    behavior: Behavior
+    reason: str
+
+class BashSecurityValidator:
+    VALIDATORS = [
+        ("shell_metachar", r"[;&|`$]"),  # shell metacharacters
+        ("sudo", r"\bsudo\b"),  # privilege escalation
+        ("rm_rf", r"\brm\s+(-[a-zA-Z]*)?r"),  # recursive delete
+        ("cmd_substitution", r"\$\("),  # command substitution
+        ("ifs_injection", r"\bIFS\s*="),  # IFS manipulation
+    ]
+
+    def validate(self, command: str) -> list:
+        return [(name, pattern) for name, pattern in self.VALIDATORS if re.search(pattern, command)]
+
+    def describe_failures(self, command: str) -> str:
+        failures = self.validate(command)
+        if not failures:
+            return "No issues detected"
+
+        parts = [f"{name} (pattern: {pattern})" for name, pattern in failures]
+        return "Security flags: " + ", ".join(parts)
+
+bash_validator = BashSecurityValidator()
+
+class PermissionManager:
+
+    def __init__(self, mode: MODE, rules: list = None):
+        if mode not in MODES:
+            raise ValueError(f"Unknow mode: {mode}, Choose from {list(MODES)}")
+
+        self.mode = mode
+        self.rules = rules or list(DEFAULT_RULES)
+        # 连续出错的次数，设置这个计数器是为了优化用户体验，避免用户一直点拒绝
+        self.consecutive_denials = 0
+        self.max_consecutive_denials = 3
+
+    # 一共5步，每一段代码都是一个关卡，只有前面的关卡放行了，后面的关卡才有意义
+    def check(self, tool_name: str, tool_input: dict) -> Decision:
+
+        # 危险命令直接拒绝
+        if tool_name == "bash":
+            command = tool_input.get("command")
+            failures = bash_validator.validate(command)
+
+            desc = bash_validator.describe_failures(command)
+            if any(failure[0] in {"sudo", "rm_rf"} for failure in failures):
+                return Decision(behavior=Behavior.DENY, reason = f"Bash validator: {desc}")
+
+            return Decision(behavior=Behavior.ASK, reason = f"Bash validator flagged: {desc}")
+
+
+        # 黑名单：用户默认拒绝
+        for rule in self.rules:
+            if rule["behavior"] != Behavior.DENY:
+                continue
+            if self._matches(rule, tool_name, tool_input):
+                return Decision(behavior=Behavior.DENY, reason = f"Blocked by deny rule: {rule}")
+
+
+        # 按照当前模式下校验规则
+
+        # 白名单：用户默认允许
+        for rule in self.rules:
+            if rule["behavior"] != Behavior.ALLOW:
+                continue
+            if self._matches(rule, tool_name, tool_input):
+                # 一旦 LLM 知道怎么合理使用工具后，将 consecutive_denials 重置为 0, 避免 LLM 由于前面被拒绝2次后一直正确使用工具但是一旦错误使用一次后，便立即建议切换模式。
+                self.consecutive_denials = 0
+                return Decision(behavior=Behavior.ALLOW, reason = f"Matched allow rule: {rule}")
+
+        # 兜底：请求用户批准
+        return Decision(behavior=Behavior.ASK, reason=f"No rule matched for {tool_name}, asking user")
+
+    # 匹配工具所有参数，工具名和参数只要有一个不对，立即返回 False
+    def _matches(self, rule: dict, tool_name: str, tool_input: dict) -> bool:
+        # 匹配 工具名称
+        if rule.get("tool") and rule["tool"] != "*":
+            if  rule["tool"] != tool_name:
+                return False
+
+        # 匹配 路径
+        # in 比 get 要更合适，无论 rule 中的 path 是什么，只要存在都为 True，
+        # get 的话只能是 除了（"" 和 None）才是 True
+        if "path" in rule and rule["path"] != "*":
+            path = tool_input.get("path", "")
+            # fnmatch 使用 Unix Shell 风格的通配符（Glob）来判断一个文件名或路径是否符合某种模式
+            # fnmatch 匹配文件路径时比正则直观、安全和标准
+            if not fnmatch(path, rule["path"]):
+                return False
+
+        # 匹配 content
+        if "content" in rule:
+            command = tool_input.get("command", "")
+            if not fnmatch(command, rule["content"]) :
+                return False
+        return True
+
+    # 用户体验与安全性的权衡: "给权限”是可以持久化的信任，但“拒权限”通常是针对当前特定场景的怀疑
+    def ask(self, tool_name: str, tool_input: dict) -> Decision:
+        # ensure_ascii=False 字符的原始 UTF-8 编码（方便人类阅读）： Python 会为了兼容性，把所有非 ASCII 字符强制转换成 Unicode 转义序列
+        print(f"\n [Permission] {tool_name}: {json.dumps(tool_input, ensure_ascii=False)[:200]}]")
+
+        answer = input(f" Allow? (y/n/always): ").strip().lower()
+
+        if answer in ("y", "yes"):
+            self.consecutive_denials = 0
+            return Decision(behavior=Behavior.ALLOW, reason=f"user allowed {tool_name}")
+
+        if answer == "always":
+            self.consecutive_denials = 0
+            self.rules.append({"tool": tool_name, "path": "*", "behavior": Behavior.ALLOW})
+            return Decision(behavior=Behavior.ALLOW, reason=f"user always allowed {tool_name}")
+
+        # 连续多次拒绝应提醒用户切换模式
+        self.consecutive_denials += 1
+        if self.consecutive_denials >= self.max_consecutive_denials:
+            print(f"[{self.consecutive_denials} consecutive denials -- " "consider switching to plan mode]")
+
+        return Decision(behavior=Behavior.DENY, reason=f"user denied {tool_name}")
+
+
 
 
 def safe_path(p: str) -> Path:
@@ -703,7 +849,7 @@ def execute_tool(block, state: CompactState) -> str:
     return output
 
 
-def agent_loop(messages: list, state: CompactState) -> None:
+def agent_loop(messages: list, state: CompactState, perms: PermissionManager) -> None:
     while True:
         messages[:] = normalize_messages(messages)
         # 例行压缩
@@ -732,7 +878,17 @@ def agent_loop(messages: list, state: CompactState) -> None:
         for block in response.content:
             if block.type == "tool_use":
                 try:
-                    output = execute_tool(block, state)
+                    decision = perms.check(block.name,block.input or {})
+
+                    if decision.behavior == Behavior.ASK:
+                        pass
+
+                    # 允许
+                    if decision.behavior == Behavior.ALLOW:
+                        pass
+                    # 拒绝
+                    else:
+                        output = execute_tool(block, state)
                 except Exception as exc:
                     output = f"Error: {exc}"
                 print(f"> {block.name} result: {str(output)[:200]}")
@@ -770,6 +926,16 @@ def agent_loop(messages: list, state: CompactState) -> None:
 
 
 if __name__ == "__main__":
+    # 选择 策略模式
+    print("Permission modes: default, plan, auto")
+
+    mode_input = input("Mode (default): ").strip().lower() or "default"
+    if mode_input not in {mode.name for mode in MODE}:
+        mode = MODE.DEFAULT
+    mode = MODE(mode_input)
+    perms = PermissionManager(mode=mode)
+    print(f"[Permission mode: {mode_input}]")
+
     history = []
     state = CompactState()
     while True:
@@ -779,8 +945,23 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        if query.startswith("/mode"):
+            # split 没有参数时，以任意连续的空白字符 作为分隔符
+            parts = query.split()
+            if len(parts) == 2 and parts[1] in {mode.name for mode in MODE}:
+                perms.mode = MODE(parts[1])
+                print(f"[Switched to {parts[1]} mode]")
+            else:
+                print(f"[Usage: /mode <{'|'.join({mode.name for mode in MODE})}>")
+
+        if query.strip() == "/rules":
+            for i, rule in enumerate(perms.rules):
+                print(f" {i}: {rule}")
+            # 这时停止往下执行，避免 将 /rules 输入到会话中
+            continue
         history.append({"role": "user", "content": query})
-        agent_loop(history, state)
+        agent_loop(history, state, perms)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
