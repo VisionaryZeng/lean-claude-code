@@ -749,15 +749,17 @@ def agent_loop(messages: list, state: CompactState) -> None:
                     compact_flag = True
                     compact_goal = (block.get("input") or {}).get("goal")
         # 没有更新时 要提醒 LLM 要更新
-        if not update_todo_flag:
-            # 　先更新　上一次更新后没有更新　TODO 的次数
-            TODO.note_round_without_update()
-            # 获取提醒
-            reminder = TODO.reminder()
-            if reminder:
-                results.insert(0, {"type": "text", "text": reminder})
-        else:
-            TODO.state.round_since_update = 0
+        # 只有 当计划没有完成时，才需要更改计划
+        if any(item.status != "completed" for item in TODO.state.plan_items):
+            if not update_todo_flag:
+                # 　先更新　上一次更新后没有更新　TODO 的次数
+                TODO.note_round_without_update()
+                # 获取提醒
+                reminder = TODO.reminder()
+                if reminder:
+                    results.insert(0, {"type": "text", "text": reminder})
+            else:
+                TODO.state.round_since_update = 0
 
         messages.append({"role": "user", "content": results})
 
