@@ -47,6 +47,8 @@ WORKDIR = Path.cwd()
 print(f"WORKDIR: {WORKDIR}")
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+READ_ONLY_TOOLS = {"read_file", "bash_readonly"}
+WRITE_TOOLS = {"write_file", "edit_file"}
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -294,9 +296,10 @@ class Behavior(Enum):
     DENY = "deny"
 
 DEFAULT_RULES = [
-    {"tool": "bash", "content": "rm -rf /", "behavior": Behavior.DENY},
-    {"tool": "bash", "content": "sudo *", "behavior": Behavior.DENY},
-    {"tool": "read_file", "path": "*", "behavior": Behavior.ALLOW},
+    {"tool": "bash", "constrains": {"command": "rm -rf /"}, "behavior": Behavior.DENY},
+    {"tool": "bash", "constrains": {"command": "sudo *"}, "behavior": Behavior.DENY},
+    {"tool": "read_file", "constrains": {"path": "*"}, "behavior": Behavior.ALLOW},
+    {"tool": "bash", "constrains": {"command": "ls -la *"}, "behavior": Behavior.ALLOW},
 ]
 
 @dataclass
@@ -345,12 +348,12 @@ class PermissionManager:
         if tool_name == "bash":
             command = tool_input.get("command")
             failures = bash_validator.validate(command)
+            if failures:
+                desc = bash_validator.describe_failures(command)
+                if any(failure[0] in {"sudo", "rm_rf"} for failure in failures):
+                    return Decision(behavior=Behavior.DENY, reason = f"Bash validator: {desc}")
 
-            desc = bash_validator.describe_failures(command)
-            if any(failure[0] in {"sudo", "rm_rf"} for failure in failures):
-                return Decision(behavior=Behavior.DENY, reason = f"Bash validator: {desc}")
-
-            return Decision(behavior=Behavior.ASK, reason = f"Bash validator flagged: {desc}")
+                return Decision(behavior=Behavior.ASK, reason = f"Bash validator flagged: {desc}")
 
 
         # 黑名单：用户默认拒绝
@@ -360,8 +363,16 @@ class PermissionManager:
             if self._matches(rule, tool_name, tool_input):
                 return Decision(behavior=Behavior.DENY, reason = f"Blocked by deny rule: {rule}")
 
-
         # 按照当前模式下校验规则
+        # 写成 mode，变成 main 方法中的 mode 变量
+        if self.mode == MODE.PLAN:
+            if tool_name in WRITE_TOOLS:
+                return Decision(behavior=Behavior.DENY, reason = "Plan mode: write operations are blocked")
+            return Decision(behavior=Behavior.ALLOW, reason="Plan mode: read-only allowed")
+
+        if self.mode == MODE.AUTO:
+            #if tool_name in READ_ONLY_TOOLS or tool_name == "read_file":
+            return Decision(behavior=Behavior.ALLOW, reason="Auto mode: read-only tool auto-approved")
 
         # 白名单：用户默认允许
         for rule in self.rules:
@@ -382,20 +393,11 @@ class PermissionManager:
             if  rule["tool"] != tool_name:
                 return False
 
-        # 匹配 路径
-        # in 比 get 要更合适，无论 rule 中的 path 是什么，只要存在都为 True，
-        # get 的话只能是 除了（"" 和 None）才是 True
-        if "path" in rule and rule["path"] != "*":
-            path = tool_input.get("path", "")
-            # fnmatch 使用 Unix Shell 风格的通配符（Glob）来判断一个文件名或路径是否符合某种模式
-            # fnmatch 匹配文件路径时比正则直观、安全和标准
-            if not fnmatch(path, rule["path"]):
-                return False
 
-        # 匹配 content
-        if "content" in rule:
-            command = tool_input.get("command", "")
-            if not fnmatch(command, rule["content"]) :
+        constrains = rule.get("constrains", {})
+        # constrains 限制是必填项，而 tool_input 中有可选项
+        for field, pattern in constrains.items():
+            if not field in tool_input or not fnmatch(str(tool_input[field]), pattern):
                 return False
         return True
 
@@ -412,7 +414,7 @@ class PermissionManager:
 
         if answer == "always":
             self.consecutive_denials = 0
-            self.rules.append({"tool": tool_name, "path": "*", "behavior": Behavior.ALLOW})
+            self.rules.append({"tool": tool_name, "constrains": tool_input, "behavior": Behavior.ALLOW})
             return Decision(behavior=Behavior.ALLOW, reason=f"user always allowed {tool_name}")
 
         # 连续多次拒绝应提醒用户切换模式
@@ -821,7 +823,6 @@ def compact_history(messages: list, state: CompactState, focus: str | None = Non
 
 # 由于增加了 block.id 和 state，需要用适配器连接
 def execute_tool(block, state: CompactState) -> str:
-    print(f"> {block.name} parameter: {block.input}")
     fn = block.name
 
     if fn == "bash":
@@ -878,17 +879,18 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager) ->
         for block in response.content:
             if block.type == "tool_use":
                 try:
-                    decision = perms.check(block.name,block.input or {})
-
+                    print(f"> {block.name} parameter: {block.input}")
+                    decision = perms.check(block.name, block.input or {})
                     if decision.behavior == Behavior.ASK:
-                        pass
-
+                        decision = perms.ask(block.name, block.input or {})
                     # 允许
                     if decision.behavior == Behavior.ALLOW:
-                        pass
+                        output = execute_tool(block, state)
                     # 拒绝
                     else:
-                        output = execute_tool(block, state)
+                        # decision['reason'] 是字典才这么访问的，decision 是对象了，再这样访问就会报错：'Decision' object is not subscriptable
+                        output = f"Permission denied by user for {block.name}: {decision.reason}"
+                        print(f"  [USER DENIED] {block.name}: {decision.reason}")
                 except Exception as exc:
                     output = f"Error: {exc}"
                 print(f"> {block.name} result: {str(output)[:200]}")
@@ -924,7 +926,7 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager) ->
             print("[manual compact]")
             messages[:] = compact_history(messages, state, compact_goal)
 
-
+# main 函数块内定义的变量是模块级全局变量，其他函数或方法命名了和main函数一样的同名变量，只要赋值了就不会被覆盖。要是不赋值，直接读取就会读取到 main函数一样的同名变量
 if __name__ == "__main__":
     # 选择 策略模式
     print("Permission modes: default, plan, auto")
@@ -949,11 +951,12 @@ if __name__ == "__main__":
         if query.startswith("/mode"):
             # split 没有参数时，以任意连续的空白字符 作为分隔符
             parts = query.split()
-            if len(parts) == 2 and parts[1] in {mode.name for mode in MODE}:
+            if len(parts) == 2 and parts[1] in {mode.value for mode in MODE}:
                 perms.mode = MODE(parts[1])
                 print(f"[Switched to {parts[1]} mode]")
             else:
-                print(f"[Usage: /mode <{'|'.join({mode.name for mode in MODE})}>")
+                print(f"[Usage: /mode <{'|'.join({mode.value for mode in MODE})}>")
+            continue
 
         if query.strip() == "/rules":
             for i, rule in enumerate(perms.rules):
