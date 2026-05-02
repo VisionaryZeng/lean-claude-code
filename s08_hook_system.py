@@ -478,12 +478,12 @@ class HookManager:
             return result
 
         # 获取 指定的 hook
-        hooks = [event for event in self.hooks[hookEvent.value] if event["type"] == hookType]
+        hooks = [event for event in self.hooks[hookEvent.value] if event["type"] == hookType.value]
 
         # 对每个hook
         for hook in hooks:
             # 匹配 工具名
-            tool_pattern = hook["matcher"]
+            tool_pattern = hook.get("matcher", "")
             if tool_pattern and context:
                 tool_name = context.get("tool_name", "")
                 if tool_pattern != "*" and tool_pattern != tool_name:
@@ -529,8 +529,12 @@ class HookManager:
         # 状态码是独立于数据流之外的控制信号，类似于 HTTP状态码
         # 0 表示执行成功
         if ret.returncode == 0:
-            if ret.stdout.strip():
+            res = ret.stdout.strip()
+            if res:
                 print(f"  [hook:{event}] {ret.stdout.strip()[:100]}")
+
+            if not res.startswith("{"):
+                return
 
             hook_output = json.loads(ret.stdout)
             if "updatedInput" in hook_output and context:
@@ -1102,6 +1106,10 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager, ho
 
 # main 函数块内定义的变量是模块级全局变量，其他函数或方法命名了和main函数一样的同名变量，只要赋值了就不会被覆盖。要是不赋值，直接读取就会读取到 main函数一样的同名变量
 if __name__ == "__main__":
+
+    hookManager = HookManager()
+    hookManager.run_hooks(HookEvent.SESSION_START, HookType.START, {"tool_name": "", "tool_input": {}})
+
     # 选择 策略模式
     print("Permission modes: default, plan, auto")
 
@@ -1112,15 +1120,11 @@ if __name__ == "__main__":
     perms = PermissionManager(mode=mode)
     print(f"[Permission mode: {mode_input}]")
 
-
-    hookManager = HookManager()
-    hookManager.run_hooks(HookEvent.SESSION_START, HookType.START,{"tool_name": "", "tool_input": {}})
-
     history = []
     state = CompactState()
     while True:
         try:
-            query = input("\033[36ms06 >> \033[0m")
+            query = input("\033[36ms08 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

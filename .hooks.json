@@ -10,24 +10,19 @@
       {
         "type": "input",
         "matcher": "bash",
-        "command": "echo 'handle PreToolUse [input] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT'"
+        "command": "echo \"handle PreToolUse [input] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT\""
       },
       {
         "type": "policy",
         "matcher": "write_file",
-        "command": "echo 'handle PreToolUse [policy] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT'"
-      },
-      {
-        "type": "audit",
-        "matcher": "*",
-        "command": "echo 'Agent 准备使用工具: $HOOK_TOOL_NAME'"
+        "command": "echo \"handle PreToolUse [policy] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT\""
       }
     ],
     "PostToolUse": [
       {
-        "type": "end",
-        "matcher": "read_file",
-        "command": "echo 'handle PreToolUse [end] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT'"
+        "type": "audit",
+        "matcher": "*",
+        "command": "echo \"handle PreToolUse [audit] event: $HOOK_TOOL_NAME> $HOOK_TOOL_INPUT\""
       }
     ]
   }
