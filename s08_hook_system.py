@@ -49,6 +49,8 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 READ_ONLY_TOOLS = {"read_file", "bash_readonly"}
 WRITE_TOOLS = {"write_file", "edit_file"}
+TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
+HOOK_TIMEOUT = 30
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -425,6 +427,136 @@ class PermissionManager:
         return Decision(behavior=Behavior.DENY, reason=f"user denied {tool_name}")
 
 
+class HookEvent(Enum):
+    SESSION_START = "SessionStart"
+    PRE_TOOL_USE = "PreToolUse"
+    POST_TOOL_USE = "PostToolUse"
+    SESSION_END = "SessionEnd"
+
+class HookType(Enum):
+    START = "start"
+    INPUT="input"
+    POLICY="policy"
+    AUDIT="audit"
+    END = "end"
+
+class HookManager:
+
+    # 初始化 并加载 hook
+    def __init__(self, hook_path: Path = None, sdk_mode: bool = False):
+        self.hooks = {HookEvent.PRE_TOOL_USE.value: [],HookEvent.POST_TOOL_USE.value: [],HookEvent.SESSION_START.value: []}
+        self._sdk_mode = sdk_mode
+        self._load_hooks(hook_path)
+
+    # 实际加载 hook
+    def _load_hooks(self, hook_path: Path):
+        hook_path = hook_path or (WORKDIR / ".hooks.json")
+        if hook_path.exists():
+            try:
+                hook_json = json.loads(hook_path.read_text())
+                hook_config = hook_json.get("hooks", {})
+                for even in HookEvent:
+                    self.hooks[even.value] = hook_config.get(even.value, [])
+
+                print(f"[Hooks loaded from {hook_path}]")
+            except Exception as e:
+                print(f"[Hook config error: {e}]")
+
+    # 校验是否在信任的文件夹里面
+    def _check_workspace(self) -> bool:
+        # 当作为 SDK 使用时环境的安全性由你的主程序（宿主环境）担保，不再需要额外的 .claude_trusted 文件来多此一举
+        if self._sdk_mode:
+            return True
+
+        # TRUST_MARKER 相当于自己显式授权可以执行外部的hooks
+        return TRUST_MARKER.exists()
+
+    def run_hooks(self, hookEvent: HookEvent, hookType: HookType, context: dict) -> dict:
+        result = {"blocked": False, "messages": []}
+        # 检查是否可信的 hook 目录
+        if not self._check_workspace():
+            return result
+
+        # 获取 指定的 hook
+        hooks = [event for event in self.hooks[hookEvent.value] if event["type"] == hookType]
+
+        # 对每个hook
+        for hook in hooks:
+            # 匹配 工具名
+            tool_pattern = hook["matcher"]
+            if tool_pattern and context:
+                tool_name = context.get("tool_name", "")
+                if tool_pattern != "*" and tool_pattern != tool_name:
+                    continue
+            # 校验 command
+            command = hook.get("command", "")
+            if not hook.get("command", ""):
+                continue
+
+            # 组装 环境变量
+            # 使用环境变量传递参数，比直接拼接命令参数要更好维护
+            env = dict(os.environ)
+            if context:
+                env["HOOK_EVENT"] = hookEvent.value
+                env["HOOK_TOOL_NAME"] = context.get("tool_name", "")
+                tool_input = context.get("tool_input", {})
+                env["HOOK_TOOL_INPUT"] = json.dumps(tool_input, ensure_ascii=False)[:10000]
+
+                if "tool_output" in context:
+                    env["HOOK_TOOL_OUTPUT"] = str(context["tool_output"])[:10000]
+
+            # 执行 工具
+            try:
+                #  执行 Hook 脚本看成在调用微服务 API
+                ret = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=WORKDIR,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=HOOK_TIMEOUT,
+                )
+                # 处理返回结果
+                self._handle_ret(ret, hookEvent.value, result, context)
+            except subprocess.TimeoutExpired:
+                print(f"  [hook:{hookEvent.value}] Timeout ({HOOK_TIMEOUT}s)")
+            except Exception as e:
+                print(f"  [hook:{hookEvent.value}] Error: {e}")
+        return result
+
+    def _handle_ret(self, ret, event: str, result: dict, context: dict):
+        # 状态码是独立于数据流之外的控制信号，类似于 HTTP状态码
+        # 0 表示执行成功
+        if ret.returncode == 0:
+            if ret.stdout.strip():
+                print(f"  [hook:{event}] {ret.stdout.strip()[:100]}")
+
+            hook_output = json.loads(ret.stdout)
+            if "updatedInput" in hook_output and context:
+                context["tool_input"] = hook_output["updatedInput"]
+
+            # 即使正常执行工具，也因为实际情况，提醒 LLM 调整
+            if "additionalContext" in hook_output:
+                result["messages"].append(hook_output["additionalContext"])
+
+            # 即使技术上执行成功，但也可能没权限，例如 token 不足
+            if "permissionDecision" in hook_output:
+                result["permission_override"] = (hook_output["permissionDecision"])
+        #  Hook 脚本主动拦截工具的执行， 类似 HTTP 503
+        elif ret.returncode == 1:
+
+            result["blocked"] = True
+            reason = ret.stderr.strip() or "Blocked by hook"
+            result["block_reason"] = reason
+            print(f"  [hook:{event}] BLOCKED: {reason[:200]}")
+            pass
+        # 2 表示 执行失败, 类似 HTTP 500
+        elif ret.returncode == 2:
+            msg = ret.stderr.strip()
+            if msg:
+                result["messages"].append(msg)
+                print(f"  [hook:{event}] INJECT: {msg[:200]}")
 
 
 def safe_path(p: str) -> Path:
@@ -849,8 +981,21 @@ def execute_tool(block, state: CompactState) -> str:
 
     return output
 
+def collect_hook_msg(pre_tool_result: dict, tool_result_content: list, hookEvent: HookEvent):
+    prefix = {
+        HookEvent.SESSION_START: "[hook]",
+        HookEvent.PRE_TOOL_USE: "[hook message]",
+        HookEvent.POST_TOOL_USE: "[hook note]",
+        HookEvent.SESSION_END: "[hook]",
+    }[hookEvent]
 
-def agent_loop(messages: list, state: CompactState, perms: PermissionManager) -> None:
+    for msg in pre_tool_result.get("messages", []):
+        tool_result_content.append({
+            "type": "text",
+            "text": f"{prefix}: {msg}]"
+        })
+
+def agent_loop(messages: list, state: CompactState, perms: PermissionManager, hooks: HookManager) -> None:
     while True:
         messages[:] = normalize_messages(messages)
         # 例行压缩
@@ -871,6 +1016,7 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager) ->
         if response.stop_reason != "tool_use":
             return
         results = []
+        tool_result_content = []
         # 标记是否更新了 TODO 列表
         update_todo_flag = False
 
@@ -878,34 +1024,62 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager) ->
         compact_goal = None
         for block in response.content:
             if block.type == "tool_use":
+                tool_input = block.input or {}
+                context = {"tool_name": block.name, "tool_input": tool_input}
                 try:
                     print(f"> {block.name} parameter: {block.input}")
-                    decision = perms.check(block.name, block.input or {})
+                    # PreToolUse 治理类型 参数纠错、路径补全、数据脱敏、格式转换
+                    input_hook_result = hooks.run_hooks(HookEvent.PRE_TOOL_USE, HookType.INPUT, context)
+                    collect_hook_msg(input_hook_result, tool_result_content, HookEvent.PRE_TOOL_USE)
+
+                    decision = perms.check(block.name, tool_input)
                     if decision.behavior == Behavior.ASK:
-                        decision = perms.ask(block.name, block.input or {})
+                        decision = perms.ask(block.name, tool_input)
                     # 允许
                     if decision.behavior == Behavior.ALLOW:
+                        # PreToolUse 决策类型 外部 API 授权、动态配额检查、复杂业务逻辑判断
+                        policy_hook_result = hooks.run_hooks(HookEvent.PRE_TOOL_USE, HookType.POLICY, context)
+                        if policy_hook_result.get("blocked"):
+                            reason = policy_hook_result.get("block_reason", "Blocked by hook")
+                            tool_result_content.append({
+                                "type": "text",
+                                "text": f"Tool blocked by PreToolUse hook: {reason}"
+                            })
+                            # 退出 工具执行
+                            continue
+
                         output = execute_tool(block, state)
                     # 拒绝
                     else:
                         # decision['reason'] 是字典才这么访问的，decision 是对象了，再这样访问就会报错：'Decision' object is not subscriptable
                         output = f"Permission denied by user for {block.name}: {decision.reason}"
-                        print(f"  [USER DENIED] {block.name}: {decision.reason}")
+                        print(f"[USER DENIED] {block.name}: {decision.reason}")
                 except Exception as exc:
                     output = f"Error: {exc}"
                 print(f"> {block.name} result: {str(output)[:200]}")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    # anthropic 规定 content 必须是 字符串
-                    "content": str(output)
+
+                tool_result_content.append({
+                    "type": "text",
+                    "text": str(output)
                 })
+                # PostToolUse 审计反馈型: 结果记录、输出内容脱敏、给 Agent 提供改进建议
+                context["tool_output"] = output
+                audit_hook_result = hooks.run_hooks(HookEvent.POST_TOOL_USE, HookType.AUDIT, context)
+                collect_hook_msg(audit_hook_result, tool_result_content, HookEvent.POST_TOOL_USE)
+
                 if block.name == "todo":
                     update_todo_flag = True
 
                 if block.name == "compact":
                     compact_flag = True
                     compact_goal = (block.get("input") or {}).get("goal")
+
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": tool_result_content
+                })
+
         # 没有更新时 要提醒 LLM 要更新
         # 只有 当计划没有完成时，才需要更改计划
         if any(item.status != "completed" for item in TODO.state.plan_items):
@@ -938,6 +1112,10 @@ if __name__ == "__main__":
     perms = PermissionManager(mode=mode)
     print(f"[Permission mode: {mode_input}]")
 
+
+    hookManager = HookManager()
+    hookManager.run_hooks(HookEvent.SESSION_START, HookType.START,{"tool_name": "", "tool_input": {}})
+
     history = []
     state = CompactState()
     while True:
@@ -964,7 +1142,7 @@ if __name__ == "__main__":
             # 这时停止往下执行，避免 将 /rules 输入到会话中
             continue
         history.append({"role": "user", "content": query})
-        agent_loop(history, state, perms)
+        agent_loop(history, state, perms, hookManager)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
