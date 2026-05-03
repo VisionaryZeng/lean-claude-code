@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from anthropic import Anthropic
 from anthropic.types import TextBlock
@@ -51,6 +51,8 @@ READ_ONLY_TOOLS = {"read_file", "bash_readonly"}
 WRITE_TOOLS = {"write_file", "edit_file"}
 TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
 HOOK_TIMEOUT = 30
+
+MEMORY_DIR = WORKDIR / ".memory"
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -561,6 +563,87 @@ class HookManager:
             if msg:
                 result["messages"].append(msg)
                 print(f"  [hook:{event}] INJECT: {msg[:200]}")
+
+class MemType(Enum):
+    USER="user"
+    FEEDBACK="feedback"
+    PROJECT="project"
+    REFERENCE="reference"
+
+@dataclass
+class Memory:
+    # 名称
+    name: str
+    # 类型
+    mem_type: MemType
+    # 描述
+    description: str
+    # 内容
+    content: str
+
+
+class MemoryManager:
+
+    def __init__(self, memo_dir: Path = None):
+        self.memo_dir = memo_dir or MEMORY_DIR
+        self.memories = {}
+
+
+    def load_memories(self):
+        pass
+
+
+    def _rebuild_index(self):
+        pass
+
+    # 解析 memory 的 md 文件
+    def _parse_frontmatter(self, path: PurePath) -> Memory | None:
+
+        # 正则解析
+        match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", path.read_text(), re.DOTALL)
+
+        if not match:
+            return None
+
+        # 获取 元数据 和 正文
+        meta = match.group(1)
+        body = match.group(2)
+
+        # 拼装 memory
+        memory = Memory(content = body)
+
+        for line in meta.splitlines():
+            if ":" in line:
+                # partition(":") 类似 split(":")，但更安全更优雅
+                key, _, value = line.partition(":")
+                if "name" == key.strip():
+                    memory.name = value
+                elif "description" == key.strip():
+                    memory.description = value
+                elif "mem_type" == key.strip():
+                    memory.mem_type = value
+        return memory
+
+
+    def build_memory_prompt(self) -> str:
+
+        # 判空
+        # 按 memory 类型遍历
+        pass
+
+
+    def save_memory(self, memory: Memory) -> str:
+        # memory 校验 memory 类型
+
+        # 规范化 文件名
+
+        # 按格式拼装 memory
+
+        # 添加到 memories
+
+        # 重建 索引
+
+        pass
 
 
 def safe_path(p: str) -> Path:
