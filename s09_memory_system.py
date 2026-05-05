@@ -39,7 +39,6 @@ from anthropic import Anthropic
 from anthropic.types import TextBlock
 from dotenv import load_dotenv
 
-from s09_memory_system_official import MAX_INDEX_LINES, MEMORY_TYPES
 
 TOOL_RSULT_LIMIT = 3
 RECENT_FILE_LIMIT = 5
@@ -57,6 +56,7 @@ HOOK_TIMEOUT = 30
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX_FILE = MEMORY_DIR / "MEMORY.md"
+MAX_INDEX_LINES = 300
 MEMORY_GUIDANCE = """
 When to save memories:
 - User states a preference ("I like tabs", "always use pytest") -> type: user
@@ -624,13 +624,13 @@ worth recalling later and is not easy to re-derive from the current repo."
 @dataclass
 class Memory:
     # 名称
-    name: str
+    name: str = ""
     # 类型
-    mem_type: MemType
+    mem_type: MemType = MemType.PROJECT
     # 描述
-    description: str
+    description: str = ""
     # 内容
-    content: str
+    content: str = ""
 
 
 class MemoryManager:
@@ -693,8 +693,8 @@ class MemoryManager:
         body = match.group(2)
 
         # 拼装 memory
-        memory = Memory(content = body)
-
+        memory = Memory()
+        memory.content = body
         for line in meta.splitlines():
             if ":" in line:
                 # partition(":") 类似 split(":")，但更安全更优雅
@@ -711,8 +711,8 @@ class MemoryManager:
     def save_memory(self, memory: Memory) -> str:
         # memory 校验 memory 类型
 
-        if memory.mem_type not in MEMORY_TYPES:
-            return f"Error: type must be one of {MEMORY_TYPES}"
+        if memory.mem_type not in MemType:
+            return f"Error: type must be one of {MemType}"
 
         # 规范化 文件名
         # 将文件名中除了[a-zA-Z0-9_-]的特殊字符全部转换为_,^ 在 [] 中表示取反
@@ -754,7 +754,7 @@ class MemoryManager:
         sections.append("")
 
         # 按 memory 类型遍历
-        for memo_type in MEMORY_TYPES:
+        for memo_type in MemType:
             sections.append(f"## [{memo_type.value}]")
             for name, memo in self.memories.items():
                 if memo_type == memo.mem_type:
@@ -1228,7 +1228,7 @@ def execute_tool(block, state: CompactState) -> str:
         output = run_subagent(block.input["prompt"])
         print("========== ========== subagent 结束 ========== ==========")
     elif fn == "save_memory":
-        memory = Memory(name=block["name"], mem_type=MemType(block["type"]), description=block["description"], content=block["content"])
+        memory = Memory(name=block.input["name"], mem_type=MemType(block.input["type"]), description=block.input["description"], content=block.input["content"])
         output =  memoryManager.save_memory(memory)
 
     else:
@@ -1379,7 +1379,7 @@ if __name__ == "__main__":
     state = CompactState()
     while True:
         try:
-            query = input("\033[36ms08 >> \033[0m")
+            query = input("\033[36ms09 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -1407,6 +1407,7 @@ if __name__ == "__main__":
                     print(f" [{memory.mem_type.value}]: {name}: {memory.description}")
             else:
                 print(f"No memory available")
+            continue
         history.append({"role": "user", "content": query})
         agent_loop(history, state, perms, hookManager, memoryManager)
         response_content = history[-1]["content"]
