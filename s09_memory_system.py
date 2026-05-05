@@ -32,11 +32,14 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from fnmatch import fnmatch
+from os.path import join
 from pathlib import Path, PurePath
 
 from anthropic import Anthropic
 from anthropic.types import TextBlock
 from dotenv import load_dotenv
+
+from s09_memory_system_official import MAX_INDEX_LINES, MEMORY_TYPES
 
 TOOL_RSULT_LIMIT = 3
 RECENT_FILE_LIMIT = 5
@@ -53,6 +56,21 @@ TRUST_MARKER = WORKDIR / ".claude" / ".claude_trusted"
 HOOK_TIMEOUT = 30
 
 MEMORY_DIR = WORKDIR / ".memory"
+MEMORY_INDEX_FILE = MEMORY_DIR / "MEMORY.md"
+MEMORY_GUIDANCE = """
+When to save memories:
+- User states a preference ("I like tabs", "always use pytest") -> type: user
+- User corrects you ("don't do X", "that was wrong because...") -> type: feedback
+- You learn a project fact that is not easy to infer from current code alone
+  (for example: a rule exists because of compliance, or a legacy module must
+  stay untouched for business reasons) -> type: project
+- You learn where an external resource lives (ticket board, dashboard, docs URL) -> type: reference
+When NOT to save:
+- Anything easily derivable from code (function signatures, file structure, directory layout)
+- Temporary task state (current branch, open PR numbers, current TODOs)
+- Secrets or credentials (API keys, passwords)
+"""
+
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -570,6 +588,39 @@ class MemType(Enum):
     PROJECT="project"
     REFERENCE="reference"
 
+
+"""
+s09_memory_system.py - Memory System
+This teaching version focuses on one core idea:
+some information should survive the current conversation, but not everything
+belongs in memory.
+Use memory for:
+  - user preferences
+  - repeated user feedback
+  - project facts that are NOT obvious from the current code
+  - pointers to external resources
+Do NOT use memory for:
+  - code structure that can be re-read from the repo
+  - temporary task state
+  - secrets
+Storage layout:
+  .memory/              <-- 核心记忆文件夹
+    MEMORY.md           <-- 自动生成的记忆索引（只读）
+    .dream_lock         <-- (可选) 梦境整合进程的 PID 锁文件
+    prefer_tabs.md      <-- 个体记忆文件 1 (Frontmatter 格式)
+    review_style.md     <-- 个体记忆文件 2
+    incident_board.md   <-- 个体记忆文件 3
+Each memory is a small Markdown file with frontmatter.
+The agent can save a memory through save_memory(), and the memory index
+is rebuilt after each write.
+An optional "Dream" pass can later consolidate, deduplicate, and prune
+stored memories. It is useful, but it is not the first thing readers need
+to understand.
+Key insight: "Memory only stores cross-session information that is still
+worth recalling later and is not easy to re-derive from the current repo."
+"""
+
+
 @dataclass
 class Memory:
     # 名称
@@ -586,15 +637,43 @@ class MemoryManager:
 
     def __init__(self, memo_dir: Path = None):
         self.memo_dir = memo_dir or MEMORY_DIR
-        self.memories = {}
-
+        self.memories: dict[str, Memory] = {}
 
     def load_memories(self):
-        pass
+        # 判断 memo_dir 是否存在
+        if not self.memo_dir.exists():
+            return
+
+        # 遍历 memo_dir 下所有 md 文件
+        for md_file in sorted(self.memo_dir.glob("*.md")):
+            if md_file.name == "MEMORY.md":
+                continue
+            memory = self._parse_frontmatter(md_file)
+            name = memory.name or md_file.name
+            if memory:
+                self.memories[name] = memory
+
+        # 重建索引
+        self._rebuild_index()
+
+        count = len(self.memories)
+        if count > 0:
+            print(f"[Memory loaded: {count} memories from {self.memo_dir}]")
 
 
     def _rebuild_index(self):
-        pass
+        if not self.memories:
+            return
+
+        lines = ["# Memory Index", ""]
+        for name, memory in self.memories.items():
+            line = f"- {name}: {memory.description} [{memory.mem_type.value}]"
+            lines.append(line)
+            if len(lines) > MAX_INDEX_LINES:
+                lines.append(f"... (truncated at {MAX_INDEX_LINES} lines)")
+                break
+        self.memo_dir.mkdir(parents=True, exist_ok=True)
+        MEMORY_INDEX_FILE.write_text("\n".join(lines) + "\n")
 
     # 解析 memory 的 md 文件
     def _parse_frontmatter(self, path: PurePath) -> Memory | None:
@@ -617,34 +696,79 @@ class MemoryManager:
                 # partition(":") 类似 split(":")，但更安全更优雅
                 key, _, value = line.partition(":")
                 if "name" == key.strip():
-                    memory.name = value
+                    memory.name = value.strip()
                 elif "description" == key.strip():
-                    memory.description = value
+                    memory.description = value.strip()
                 elif "mem_type" == key.strip():
-                    memory.mem_type = value
+                    memory.mem_type = value.strip()
         return memory
 
 
-    def build_memory_prompt(self) -> str:
 
-        # 判空
-        # 按 memory 类型遍历
-        pass
 
 
     def save_memory(self, memory: Memory) -> str:
         # memory 校验 memory 类型
 
+        if memory.mem_type not in MEMORY_TYPES:
+            return f"Error: type must be one of {MEMORY_TYPES}"
+
         # 规范化 文件名
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]",  "_", memory.name.lower())
+        if not safe_name:
+            return "Error: invalid memory name"
+
+        self.memo_dir.mkdir(parents=True, exist_ok=True)
 
         # 按格式拼装 memory
+        frontmatter = (
+            f"---\n"
+            f"name: {memory.name}\n"
+            f"description: {memory.description}\n"
+            f"type: {memory.mem_type.value}\n"
+            f"---\n"
+            f"content: {memory.content}\n"
+        )
+        file_name = f"{safe_name}.md"
+        file_path = self.memo_dir / file_name
+        file_path.write_text(frontmatter)
 
         # 添加到 memories
+        self.memories[memory.name] = memory
 
         # 重建 索引
+        self._rebuild_index()
+        return f"Saved memory '{memory.name} to {file_path.relative_to(WORKDIR)}'"
 
-        pass
+    def load_memory_prompt(self) -> str:
+        # 判空
+        if not self.memories:
+            return ""
 
+        sections = []
+        sections.append(f"# Memories (persistent across sessions)")
+        sections.append("")
+
+        # 按 memory 类型遍历
+        for memo_type in MEMORY_TYPES:
+            sections.append(f"## [{memo_type.value}]")
+            for name, memo in self.memories.items():
+                if memo_type == memo.mem_type:
+                    sections.append(f"### {name}: {memo.description}")
+                    if memo.content.strip():
+                        sections.append(memo.content.strip())
+                    # 空行 语义边界感
+                    sections.append("")
+        return "\n".join(sections)
+
+    def build_system_prompt(self):
+        sys_prompt = [f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."]
+
+        memory_section = self.load_memory_prompt()
+        if memory_section:
+            sys_prompt.append(memory_section)
+        sys_prompt.append(MEMORY_GUIDANCE)
+        return "\n\n".join(sys_prompt)
 
 def safe_path(p: str) -> Path:
     # pathlib 的 / 操作符对绝对路径有特殊处理：如果右边p是绝对路径，会忽略左边WORKDIR的路径。
@@ -830,7 +954,43 @@ CHILD_TOOLS = [
             },
             "required": ["skill_name"]
         }
-    }
+    },
+
+    {
+        "name": "save_memory",
+        "description": "Save a persistent memory that survives across sessions.",
+        "input_schema":
+            {
+                "type": "object",
+                "properties":
+                    {
+                        "name":
+                            {
+                                "type": "string",
+                                "description": "Short identifier (e.g. prefer_tabs, db_schema)"
+                            },
+                        "description":
+                            {
+                                "type": "string",
+                                "description": "One-line summary of what this memory captures"
+                            },
+                        "type":
+                            {
+                                "type": "string",
+                                "enum": ["user", "feedback", "project", "reference"],
+                                "description": "user=preferences, feedback=corrections, project=non-obvious project conventions or decision reasons, reference=external resource pointers"
+                            },
+                        "content":
+                            {
+                                "type": "string",
+                                "description": "Full memory content (multi-line OK)"
+                            },
+                    },
+                "required": ["name", "description", "type", "content"]
+            }
+    },
+
+
 ]
 
 PARENT_TOOLS = CHILD_TOOLS + [
@@ -1063,6 +1223,10 @@ def execute_tool(block, state: CompactState) -> str:
         print(f"> task ({desc}): {prompt[:80]}")
         output = run_subagent(block.input["prompt"])
         print("========== ========== subagent 结束 ========== ==========")
+    elif fn == "save_memory":
+        memory = Memory(name=block["name"], mem_type=MemType(block["type"]), description=block["description"], content=block["content"])
+        output =  memoryManager.save_memory(memory)
+
     else:
         output = f"Unknown tool: {fn}"
 
@@ -1082,7 +1246,7 @@ def collect_hook_msg(pre_tool_result: dict, tool_result_content: list, hookEvent
             "text": f"{prefix}: {msg}]"
         })
 
-def agent_loop(messages: list, state: CompactState, perms: PermissionManager, hooks: HookManager) -> None:
+def agent_loop(messages: list, state: CompactState, perms: PermissionManager, hooks: HookManager, memories: MemoryManager) -> None:
     while True:
         messages[:] = normalize_messages(messages)
         # 例行压缩
@@ -1091,10 +1255,10 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager, ho
         if len(str(messages)) > CONTEXT_LIMIT:
             print("[auto compact]")
             messages[:] = compact_history(messages, state)
-
+        system_prompt = memories.build_system_prompt()
         response = client.messages.create(
             model=MODEL,
-            system=SYSTEM,
+            system=system_prompt,
             messages=messages,
             tools=PARENT_TOOLS,
             max_tokens=8000,
@@ -1190,8 +1354,12 @@ def agent_loop(messages: list, state: CompactState, perms: PermissionManager, ho
 # main 函数块内定义的变量是模块级全局变量，其他函数或方法命名了和main函数一样的同名变量，只要赋值了就不会被覆盖。要是不赋值，直接读取就会读取到 main函数一样的同名变量
 if __name__ == "__main__":
 
+
     hookManager = HookManager()
     hookManager.run_hooks(HookEvent.SESSION_START, HookType.START, {"tool_name": "", "tool_input": {}})
+
+    memoryManager = MemoryManager()
+    memoryManager.load_memories()
 
     # 选择 策略模式
     print("Permission modes: default, plan, auto")
@@ -1229,7 +1397,7 @@ if __name__ == "__main__":
             # 这时停止往下执行，避免 将 /rules 输入到会话中
             continue
         history.append({"role": "user", "content": query})
-        agent_loop(history, state, perms, hookManager)
+        agent_loop(history, state, perms, hookManager, memoryManager)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
