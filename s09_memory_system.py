@@ -639,11 +639,14 @@ class MemoryManager:
         self.memo_dir = memo_dir or MEMORY_DIR
         self.memories: dict[str, Memory] = {}
 
+    # 加载所有的 memory ，涉及大量的 IO 操作，不要在 __init__ 调用，方便出错好排查
     def load_memories(self):
         # 判断 memo_dir 是否存在
         if not self.memo_dir.exists():
             return
 
+        # 清空 原来的 memories
+        self.memories = {}
         # 遍历 memo_dir 下所有 md 文件
         for md_file in sorted(self.memo_dir.glob("*.md")):
             if md_file.name == "MEMORY.md":
@@ -673,6 +676,7 @@ class MemoryManager:
                 lines.append(f"... (truncated at {MAX_INDEX_LINES} lines)")
                 break
         self.memo_dir.mkdir(parents=True, exist_ok=True)
+        # 会完全覆盖（Overwrite）掉 MEMORY_INDEX 文件原有的所有内容
         MEMORY_INDEX_FILE.write_text("\n".join(lines) + "\n")
 
     # 解析 memory 的 md 文件
@@ -704,9 +708,6 @@ class MemoryManager:
         return memory
 
 
-
-
-
     def save_memory(self, memory: Memory) -> str:
         # memory 校验 memory 类型
 
@@ -714,6 +715,7 @@ class MemoryManager:
             return f"Error: type must be one of {MEMORY_TYPES}"
 
         # 规范化 文件名
+        # 将文件名中除了[a-zA-Z0-9_-]的特殊字符全部转换为_,^ 在 [] 中表示取反
         safe_name = re.sub(r"[^a-zA-Z0-9_-]",  "_", memory.name.lower())
         if not safe_name:
             return "Error: invalid memory name"
@@ -740,6 +742,7 @@ class MemoryManager:
         self._rebuild_index()
         return f"Saved memory '{memory.name} to {file_path.relative_to(WORKDIR)}'"
 
+    # 全量加载 memory
     def load_memory_prompt(self) -> str:
         # 判空
         if not self.memories:
@@ -747,6 +750,7 @@ class MemoryManager:
 
         sections = []
         sections.append(f"# Memories (persistent across sessions)")
+        # 空行 语义边界感
         sections.append("")
 
         # 按 memory 类型遍历
@@ -1396,6 +1400,13 @@ if __name__ == "__main__":
                 print(f" {i}: {rule}")
             # 这时停止往下执行，避免 将 /rules 输入到会话中
             continue
+
+        if query.strip() == "/memory":
+            if memoryManager.memories:
+                for name, memory in memoryManager.memories.items():
+                    print(f" [{memory.mem_type.value}]: {name}: {memory.description}")
+            else:
+                print(f"No memory available")
         history.append({"role": "user", "content": query})
         agent_loop(history, state, perms, hookManager, memoryManager)
         response_content = history[-1]["content"]
