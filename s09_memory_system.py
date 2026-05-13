@@ -827,6 +827,65 @@ class MemoryManager:
         sys_prompt.append(MEMORY_GUIDANCE)
         return "\n\n".join(sys_prompt)
 
+    # 做梦 整合记忆文件
+    # 1.在保存记忆时
+    #   按类进行整理
+    #   如果发现有矛盾的记忆，按 时间优先（最新为准）> 重要性优先 > 频率/一致性优先 > 场景区分 > 保留矛盾 + 标注 优先级处理矛盾
+    #       记忆权重量化：
+    #               维度,                         权重,     如何给新记忆打分（0~1）,                                      实现方式建议
+    #               strength（语气强度）,          0.35,     是否用了“必须”“强烈”“绝对”“特别不喜欢”等强烈词语,                规则 + LLM
+    #               criticality（业务关键度）,     0.25,      是否涉及项目核心功能、交付物、成本、合规、安全、用户体验关键点,      LLM 判断
+    #               frequency（重复度）,          0.15,      该主题在近期是否已被多次提到,                                  向量检索统计
+    #               emotion（情感强度）,          0.10,      是否表达了明显不满、兴奋、失望、赞赏等情绪,                       LLM + 规则
+    #               recency（时效性）,            0.10,      新记忆默认给 0.95~1.0（越新越高）,                             时间计算
+    #               category（类别权重）,         0.05,      预设不同类别的基准分（项目要求 > 用户反馈 > 一般偏好）,            固定映射表
+
+    #   实际整合记忆时，要提示 LLM 当前任务要求
+    # 2.额外再定时整合所有的记忆，进一步优化记忆
+    def consolidation(self, mem_type: MemType = None) -> str:
+        # 获取当前最新的记忆文件夹
+        to_merge_memory: dict[MemType,list[Memory]] = {}
+        if mem_type == None:
+            for type in MemType:
+                to_merge_memory[type] = []
+                for _, memo in self.memories.items():
+                    if type == memo.mem_type:
+                        to_merge_memory[type].append(memo)
+        else:
+            to_merge_memory[mem_type] = []
+            for _, memo in self.memories.items():
+                if mem_type == memo.mem_type:
+                    to_merge_memory[mem_type].append(memo)
+
+        # 拼装成完整的 prompt ，提醒 LLM 按 记忆类型分类记忆
+        merge_prompt = '''
+        你是一个专业的记忆架构师，正在帮助 Agent 更好地服务用户当前的任务。
+
+        【当前任务目标】
+        {current_goal}
+        
+        【当前项目/阶段背景】
+        {project_context}   // 可选：项目类型、当前阶段、关键约束等
+        
+        请将以下【{category}】类别的多条记忆进行高质量合并。
+        
+        合并原则：
+        1. 优先保留与当前任务目标高度相关的记忆。
+        2. 对与当前目标冲突或过时的记忆，进行合理弱化、标注或场景化处理。
+        3. 突出那些能直接提升任务完成质量的关键偏好和规则。
+        4. 显式标注矛盾，并根据当前目标给出推荐优先级。
+        5. 输出控制在精炼、高信息密度。
+        
+        原始记忆：
+        {memories_or_clusters}
+        '''
+
+        # 调用 LLM 整合 记忆
+        # 创建 .dream 文件夹
+        # 生成新的记忆文件 输出到 .dream 文件夹中
+
+        pass
+
 def safe_path(p: str) -> Path:
     # pathlib 的 / 操作符对绝对路径有特殊处理：如果右边p是绝对路径，会忽略左边WORKDIR的路径。
     path = (WORKDIR / p).resolve()
