@@ -24,6 +24,7 @@
     6.4 思考循环结束后打印返回消息
 
 """
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import re
@@ -633,22 +634,45 @@ class Memory:
     content: str = ""
 
 
+# 输出北京东八区时间戳 20250515_22-40-00_123
+def get_timestamp() -> str:
+    return datetime.fromtimestamp(int(time.time()), timezone(timedelta(hours=8))).strftime('%Y%m%d_%H-%M-%S_%f')[:-3]
+
+
 class MemoryManager:
 
     def __init__(self, memo_dir: Path = None):
-        self.memo_dir = memo_dir or MEMORY_DIR
+        # self.memo_dir = memo_dir or MEMORY_DIR
         self.memories: dict[str, Memory] = {}
+
+    # 获取 最新的 记忆文件夹
+    def _get_memo_dir(self) -> Path :
+        # 获取.memory 下所有的记忆文件夹，忽略做梦中的文件夹
+        memo_dirs = [dir for dir in MEMORY_DIR.iterdir() if dir.is_dir() and not dir.name.endswith(".dream")]
+
+        # 没有记忆文件夹就生成一个
+        if len(memo_dirs) == 0:
+            memo_dir = MEMORY_DIR / get_timestamp()
+            memo_dir.mkdir(parents=True, exist_ok=True)
+            return memo_dir
+        # 按 创建日期排序
+        memo_dirs = sorted(memo_dirs, key=lambda d: getattr(d.stat(), "st_birthtime", d.stat().st_mtime))
+        # 返回最后创建的文件夹
+        return memo_dirs[-1]
 
     # 加载所有的 memory ，涉及大量的 IO 操作，不要在 __init__ 调用，方便出错好排查
     def load_memories(self):
-        # 判断 memo_dir 是否存在
-        if not self.memo_dir.exists():
+
+        memo_dir = self._get_memo_dir()
+
+        # 判断 memo_dir 为空文件夹，就提前结束
+        if not any(memo_dir.iterdir()):
             return
 
         # 清空 原来的 memories
         self.memories = {}
         # 遍历 memo_dir 下所有 md 文件
-        for md_file in sorted(self.memo_dir.glob("*.md")):
+        for md_file in sorted(memo_dir.glob("*.md")):
             if md_file.name == "MEMORY.md":
                 continue
             memory = self._parse_frontmatter(md_file)
@@ -661,7 +685,7 @@ class MemoryManager:
 
         count = len(self.memories)
         if count > 0:
-            print(f"[Memory loaded: {count} memories from {self.memo_dir}]")
+            print(f"[Memory loaded: {count} memories from {memo_dir}]")
 
 
     def _rebuild_index(self):
@@ -675,7 +699,6 @@ class MemoryManager:
             if len(lines) > MAX_INDEX_LINES:
                 lines.append(f"... (truncated at {MAX_INDEX_LINES} lines)")
                 break
-        self.memo_dir.mkdir(parents=True, exist_ok=True)
         # 会完全覆盖（Overwrite）掉 MEMORY_INDEX 文件原有的所有内容
         MEMORY_INDEX_FILE.write_text("\n".join(lines) + "\n")
 
@@ -720,8 +743,6 @@ class MemoryManager:
         if not safe_name:
             return "Error: invalid memory name"
 
-        self.memo_dir.mkdir(parents=True, exist_ok=True)
-
         # 按格式拼装 memory
         frontmatter = (
             f"---\n"
@@ -729,18 +750,50 @@ class MemoryManager:
             f"description: {memory.description}\n"
             f"type: {memory.mem_type.value}\n"
             f"---\n"
-            f"content: {memory.content}\n"
+            f"{memory.content}\n"
         )
-        file_name = f"{safe_name}.md"
-        file_path = self.memo_dir / file_name
+        file_name = f"{safe_name}.new.md.tmp"
+        memo_dir = self._get_memo_dir()
+        file_path = memo_dir / file_name
         file_path.write_text(frontmatter)
-
+        # 去掉 .tmp 后缀表示写完了
+        final_path = memo_dir / f"{safe_name}.new.md"
+        os.rename(file_path, final_path)
         # 添加到 memories
         self.memories[memory.name] = memory
 
         # 重建 索引
         self._rebuild_index()
+
+        # 检查是否存最新的记忆文件夹或 .dream 文件夹
+
+        dream_dir = [dir for dir in MEMORY_DIR.iterdir() if dir.is_dir() and dir.name.endswith(".dream")][0]
+        if dream_dir:
+            last_memo_dir = dream_dir
+        else:
+            last_memo_dir = self._get_memo_dir()
+
+        # 拷贝到最新记忆文件夹中
+        if last_memo_dir != memo_dir:
+            self.copy_to_last_dir(final_path, last_memo_dir)
+
         return f"Saved memory '{memory.name} to {file_path.relative_to(WORKDIR)}'"
+
+    # 安全复制记忆文件到最新的记忆文件夹
+    def copy_to_last_dir(self, source_memo: Path, last_memo_dir: Path):
+        try:
+            dir_fd = os.open(last_memo_dir, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            # 避免打开过程中出现 .dream 文件夹改名
+            last_memo_dir = self._get_memo_dir()
+            dir_fd = os.open(last_memo_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            dest_fd = os.open(source_memo.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, dir_fd)
+            with os.fdopen(dest_fd, "wb") as dest:
+                dest.write(source_memo.read_bytes())
+            print(f"{source_memo.name} 已经安全拷贝到 {last_memo_dir.name}")
+        finally:
+            os.close(dir_fd)
 
     # 全量加载 memory
     def load_memory_prompt(self) -> str:

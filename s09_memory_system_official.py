@@ -208,6 +208,15 @@ class DreamConsolidator:
         self.last_consolidation_time = 0.0
         self.last_scan_time = 0.0
         self.session_count = 0
+
+    # 顺序,   门禁,                     理由,                                                         成本
+    # 1,    Gate 1: Enabled,            总开关，如果是关的，后面什么都不用看。,                           极低 (Bool)
+    # 2,    Gate 5: Throttle,           防抖保护。如果 10 分钟内刚查过，直接跳过。它保护了下面所有的逻辑。,   极低 (Math)
+    # 3,    Gate 3: Plan Mode,          逻辑状态检查。如果是预览模式，直接退出。,                         极低 (String)
+    # 4,    Gate 6: Session Count,      简单的计数器检查。,                                            极低 (Int)
+    # 5,    Gate 4: Cooldown,           业务逻辑的大钟表（24 小时）。,                                  低 (Math)
+    # 6,    Gate 2: Directory/Files,    第一次触碰磁盘。确定真的有活干。,                                中 (Disk IO)
+    # 7,    Gate 7: PID Lock,           最重的操作。读写文件 + 进程信号。,                               高 (Heavy IO)
     def should_consolidate(self) -> tuple[bool, str]:
         """
         Check 7 gates in sequence. All must pass.
@@ -228,6 +237,7 @@ class DreamConsolidator:
             return False, "Gate 2: no memory files found"
         # Gate 3: not in plan mode (only consolidate in active modes)
         if self.mode == "plan":
+            # plan 模式意味着只读，不能修改记忆
             return False, "Gate 3: plan mode does not allow consolidation"
         # Gate 4: 24-hour cooldown since last consolidation
         time_since_last = now - self.last_consolidation_time
@@ -260,6 +270,7 @@ class DreamConsolidator:
         print("[Dream] Starting consolidation...")
         self.last_scan_time = time.time()
         completed_phases = []
+        # 1 表示 请从 1 开始计数
         for i, phase in enumerate(self.PHASES, 1):
             print(f"[Dream] Phase {i}/4: {phase}")
             completed_phases.append(phase)
@@ -267,6 +278,8 @@ class DreamConsolidator:
         self._release_lock()
         print(f"[Dream] Consolidation complete: {len(completed_phases)} phases executed")
         return completed_phases
+
+    # 安全地获得锁
     def _acquire_lock(self) -> bool:
         """
         Acquire a PID-based lock file. Returns False if locked by another
@@ -282,17 +295,25 @@ class DreamConsolidator:
                 # Check if lock is stale
                 if (time.time() - lock_time) > self.LOCK_STALE_SECONDS:
                     print(f"[Dream] Removing stale lock from PID {pid}")
+                    # 删除文件，等同于释放锁
                     self.lock_file.unlink()
                 else:
                     # Check if owning process is still alive
                     try:
+                        # 侦察进程的存活状态，并不是要杀掉进程
+                        # 执行情况,     结果,                             含义
+                        # 进程存在,     执行成功（不报错）,                  进程依然活跃。
+                        # 进程不存在,   抛出 OSError (Errno 3),            进程已经结束，这是一个“死锁”。
+                        # 无权限,      抛出 PermissionError (Errno 1),    进程存在，但你（当前用户）管不了它。
                         os.kill(pid, 0)
                         return False  # process alive, lock is valid
                     except OSError:
                         print(f"[Dream] Removing lock from dead PID {pid}")
                         self.lock_file.unlink()
+            # ValueError 处理 lock_file 中错误的数值
             except (ValueError, OSError):
                 # Corrupted lock file, remove it
+                # 不让“脏数据”或“残留状态”变成系统的“永久路障”
                 self.lock_file.unlink(missing_ok=True)
         # Write new lock
         try:
@@ -301,6 +322,8 @@ class DreamConsolidator:
             return True
         except OSError:
             return False
+
+    # 释放锁
     def _release_lock(self):
         """Release the lock file if we own it."""
         try:
@@ -311,6 +334,21 @@ class DreamConsolidator:
                     self.lock_file.unlink()
         except (ValueError, OSError):
             pass
+
+    # 做梦 整合记忆文件
+    def consolidation(self) -> str:
+        # 获取当前最新的记忆文件夹
+        # 在最新的记忆文件夹下获取所有写完的记忆文件，忽略还没写完的.tmp 文件
+
+        # 创建 .dream 文件夹
+        # 拼装成完整的 prompt ，提醒 LLM 按 记忆类型分类记忆
+        # 调用 LLM 整合 记忆
+        # 生成新的记忆文件 输出到 .dream 文件夹中
+
+
+
+        pass
+
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
