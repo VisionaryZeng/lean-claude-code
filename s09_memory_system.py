@@ -752,13 +752,13 @@ class MemoryManager:
             f"---\n"
             f"{memory.content}\n"
         )
-        file_name = f"{safe_name}.new.md.tmp"
+        # 未完成时，带上 tmp 点后缀，避免被加载
         memo_dir = self._get_memo_dir()
-        file_path = memo_dir / file_name
-        file_path.write_text(frontmatter)
+        tmp_path = memo_dir / f"{safe_name}.new.md.tmp"
+        tmp_path.write_text(frontmatter)
         # 去掉 .tmp 后缀表示写完了
         final_path = memo_dir / f"{safe_name}.new.md"
-        os.rename(file_path, final_path)
+        os.rename(tmp_path, final_path)
         # 添加到 memories
         self.memories[memory.name] = memory
 
@@ -777,7 +777,7 @@ class MemoryManager:
         if last_memo_dir != memo_dir:
             self.copy_to_last_dir(final_path, last_memo_dir)
 
-        return f"Saved memory '{memory.name} to {file_path.relative_to(WORKDIR)}'"
+        return f"Saved memory '{memory.name} to {final_path.relative_to(WORKDIR)}'"
 
     # 安全复制记忆文件到最新的记忆文件夹
     def copy_to_last_dir(self, source_memo: Path, last_memo_dir: Path):
@@ -796,7 +796,7 @@ class MemoryManager:
             os.close(dir_fd)
 
     # 全量加载 memory
-    def load_memory_prompt(self) -> str:
+    def _load_memory_prompt(self) -> str:
         # 判空
         if not self.memories:
             return ""
@@ -821,7 +821,7 @@ class MemoryManager:
     def build_system_prompt(self):
         sys_prompt = [f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."]
 
-        memory_section = self.load_memory_prompt()
+        memory_section = self._load_memory_prompt()
         if memory_section:
             sys_prompt.append(memory_section)
         sys_prompt.append(MEMORY_GUIDANCE)
